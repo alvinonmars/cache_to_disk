@@ -54,13 +54,66 @@ from os.path import (
 from time import sleep
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
-logger = logging.getLogger(__name__)
+import logging,os
+from datetime import datetime
+
+
+def get_logger(name,console_enable = False,propagate = False, log_dir='/mnt/disk1/log'):
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+    # formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    # formatter = logging.Formatter('%(asctime)s [PID %(process)d] %(levelname)s %(name)s - %(message)s')
+    formatter = logging.Formatter('%(asctime)s [PID %(process)d] %(levelname)s (%(name)s::%(funcName)s:%(lineno)d) - %(message)s')
+    # remove all handlers
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+
+    # set log handler to save to file
+    now_str = datetime.now().strftime("%Y-%m-%d")
+    # print(f"Logging to {log_dir}")
+    # print(f"now {datetime.now()}")
+    # print(f"python version {os.popen('python --version').read()}")
+    # print(f"python path {os.popen('which python').read()}")
+    # create log dir if not exist
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except Exception as e:
+        print(f"Failed to create log directory {log_dir}: {e}")
+        return None
+
+    log_file = f"{log_dir}/{name}_{now_str}.log"
+    # print(f"Logging to {log_file}")
+    try:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+        # print(f"Logging to file {log_file}")
+    except Exception as e:
+        print(f"Failed to add file handler: {e}")
+        return None
+    if console_enable:
+        try:
+            console_handler = logging.StreamHandler()
+            console_handler.setLevel(logging.WARNING)
+            console_handler.setFormatter(formatter)
+            logger.addHandler(console_handler)
+            print(f"Logging to console")
+        except Exception as e:
+            print(f"Failed to add console handler: {e}")
+            # return None
+    logger.propagate = propagate
+    return logger
+
+# logger = logging.getLogger(__name__)
+
+logger = get_logger(__name__,console_enable = True,propagate = False, log_dir='/mnt/disk1/log')
 
 if logger.handlers is None:
     # Don't log unless user explicitly adds a handler
     logger.addHandler(logging.NullHandler())
 
-MAX_PICKLE_BYTES = 2**32 - 1
+MAX_PICKLE_BYTES = 2**31 - 1
 DISK_CACHE_DIR = expanduser(
     expandvars(
         getenv("DISK_CACHE_DIR", join_path(dirname(realpath(__file__)), "disk_cache"))
@@ -208,17 +261,40 @@ import numpy as np
 def try_save_numpy(data: Any, file_path: str) -> bool:
     # check if data is numpy array
     if isinstance(data, np.ndarray):
-        np.save(file_path, data)
-        if (load_numpy(file_path,True) is None):
-            os.remove(file_path)
-            np.save(file_path, data)
+        with open_exclusive(file_path, "wb") as f:
+            np.save(f, data)
+            f.flush()
+            os.fsync(f.fileno())   
+            
+        file_bytes = os.path.getsize(file_path)
+        data_size = data.nbytes
+        # sleep to ensure file is written to disk
+        while file_bytes < data_size:
+            sleep(0.1)
+            file_bytes = os.path.getsize(file_path)
+            logger.warnings(f"File size {file_bytes} < data size {data_size} human readable {np.round(file_bytes/1024/1024,2)}MB < {np.round(data_size/1024/1024,2)}MB")
+        
+        cahce_ready = False
+        
+        while not cahce_ready:
+            try:
+                data = np.load(file_path, mmap_mode='c')
+                cahce_ready = True
+            except Exception as e:
+                logger.warning(f"Failed to load numpy file {file_path} {e}")
+                sleep(0.1)
+        logger.info(f"Saved numpy file {file_path} size {data.nbytes} human readable {np.round(data.nbytes/1024/1024,2)}MB success")
         return True
     return False
 
 def load_numpy(file_path: str,enable_memmap=True) -> np.ndarray:
     data = None
     try:
+        with open_shared(file_path, "rb") as f:
+            pass
+        
         data = np.load(file_path, mmap_mode='c')
+            # data = np.load(f, mmap_mode='c')
     except Exception as e:
         logger.warning("Failed to load numpy file %s: %s", file_path, e)
     
@@ -234,6 +310,9 @@ def pickle_big_data(data: Any, file_path: str) -> None:
     with open_exclusive(file_path, "wb") as f_out:
         for idx in range(0, len(bytes_out), MAX_PICKLE_BYTES):
             f_out.write(bytes_out[idx: idx + MAX_PICKLE_BYTES])
+            # flush and fsync to ensure data is written to disk
+            f_out.flush()
+            os.fsync(f_out.fileno())
 
 
 def unpickle_big_data(file_path: str) -> Any:
@@ -329,6 +408,49 @@ def cache_exists(
         return False, None
     new_caches_for_function = []
     cache_changed = False
+    
+    # is_npy = isinstance(function_value, np.ndarray)
+    # post_fix = ".npy" if is_npy else ".pkl"
+    # new_file_name = str(int(cache_metadata[_TOTAL_NUMCACHE_KEY]) + 1) + post_fix
+    new_file_name = get_hash_filename(function_name,str(args),str(kwargs))
+    new_file_name = new_file_name
+    file_path_npy = join_path(DISK_CACHE_DIR, new_file_name+'.npy')
+    file_path_pkl = join_path(DISK_CACHE_DIR, new_file_name+'.pkl')
+    is_npy = file_exists(file_path_npy)
+    is_pkl = file_exists(file_path_pkl)
+    if is_npy:
+        file_name = file_path_npy
+    elif is_pkl:
+        file_name = file_path_pkl
+    else:
+        return False, None
+    max_age_days = UNLIMITED_CACHE_AGE
+    for function_cache in cache_metadata[function_name]:
+        if function_cache["args"] == str(args) and (function_cache["kwargs"] == str(kwargs)):
+            max_age_days = int(function_cache["max_age_days"])
+            break
+
+    if get_age_of_file(file_name) > max_age_days != UNLIMITED_CACHE_AGE:
+        logger.info(f"Cache file {file_name} is stale, removing args {args} kwargs {kwargs}")
+        os.remove(file_name)
+        cache_changed = True
+    else:
+        function_value = unpickle_big_data(file_name)
+        if function_value is not None:
+            return True, function_value
+        else:
+            logger.warning(f"Failed to load cache file {file_name} args {args} kwargs {kwargs}")
+            return False, None
+    return False, None
+
+
+def cache_exists2(
+    cache_metadata: Dict, function_name: str, *args, **kwargs
+) -> Tuple[bool, Any]:
+    if function_name not in cache_metadata:
+        return False, None
+    new_caches_for_function = []
+    cache_changed = False
     for function_cache in cache_metadata[function_name]:
         if function_cache["args"] == str(args) and (
             function_cache["kwargs"] == str(kwargs)
@@ -337,6 +459,7 @@ def cache_exists(
             file_name = join_path(DISK_CACHE_DIR, function_cache["file_name"])
             if file_exists(file_name):
                 if get_age_of_file(file_name) > max_age_days != UNLIMITED_CACHE_AGE:
+                    logger.info(f"Cache file {file_name} is stale, removing args {args} kwargs {kwargs}")
                     os.remove(file_name)
                     cache_changed = True
                 else:
@@ -344,11 +467,15 @@ def cache_exists(
                     if function_value is not None:
                         return True, function_value
                     else:
-                        os.remove(file_name)
-                        cache_changed = True
+                        logger.warning(f"Failed to load cache file {file_name} args {args} kwargs {kwargs}")
+                        return False, None
+                        # os.remove(file_name)
+                        # cache_changed = True
             else:
+                logger.info(f"Cache file {file_name} does not exist args {args} kwargs {kwargs}")
                 cache_changed = True
         else:
+            # logger.info(f"Cache file {function_cache['file_name']} args {args} kwargs {kwargs} does not match")
             new_caches_for_function.append(function_cache)
     if cache_changed:
         if new_caches_for_function:
@@ -358,6 +485,43 @@ def cache_exists(
         write_cache_file(cache_metadata)
     return False, None
 
+def cache_exists_for_function(function_name: str,*args, **kwargs)-> Tuple[bool, Any]:
+    cache_metadata = load_cache_metadata_json()
+    return cache_exists(cache_metadata,function_name,*args, **kwargs)
+
+def cache_exists_rename_to_hash():
+    cache_metadata = load_cache_metadata_json()
+    for function_name, function_caches in cache_metadata.items():
+        if function_name == _TOTAL_NUMCACHE_KEY:
+            continue
+        to_keep = []
+        for function_cache in function_caches:
+            max_age_days = int(function_cache["max_age_days"])
+            old_filename = function_cache["file_name"]
+            file_postfix = old_filename.split('.')[-1]
+            hash_filename = get_hash_filename(function_name,function_cache["args"],function_cache["kwargs"])
+            hash_filename = hash_filename + '.' + file_postfix
+            
+            if old_filename != hash_filename:
+                logger.info(f"Renaming cache file {old_filename} to {hash_filename}")
+                os.rename(join_path(DISK_CACHE_DIR, old_filename),join_path(DISK_CACHE_DIR, hash_filename))
+                logger.info(f"Renamed cache file {old_filename} to {hash_filename}")
+                function_cache["file_name"] = hash_filename
+            to_keep.append(function_cache)
+        cache_metadata[function_name] = to_keep
+    
+    write_cache_file(cache_metadata)
+    
+
+import hashlib
+
+def get_hash_filename(function_name,*args,**kwargs):
+    # Generate a unique, human-readable filename based on input parameters
+    filename = function_name+'_'+str(args)+'_'+str(kwargs)
+
+    hash_str = hashlib.sha1(str(filename).encode()).hexdigest()
+    filename = f"{function_name}_{hash_str}"
+    return filename
 
 def cache_function_value(
     function_value: Any,
@@ -372,7 +536,10 @@ def cache_function_value(
     function_caches = cache_metadata.get(function_name, [])
     is_npy = isinstance(function_value, np.ndarray)
     post_fix = ".npy" if is_npy else ".pkl"
-    new_file_name = str(int(cache_metadata[_TOTAL_NUMCACHE_KEY]) + 1) + post_fix
+    # new_file_name = str(int(cache_metadata[_TOTAL_NUMCACHE_KEY]) + 1) + post_fix
+    new_file_name = get_hash_filename(function_name,str(args),str(kwargs))
+    new_file_name = new_file_name + post_fix
+            
     new_cache = {
         "args": str(args),
         "kwargs": str(kwargs),
