@@ -76,7 +76,7 @@ DISK_CACHE_FILE = expanduser(
 DISK_CACHE_FILE_LOCK = "{}.lock".format(DISK_CACHE_FILE)
 
 # By default, retry lock attempts every 0.1 seconds for up to 5 seconds
-DISK_CACHE_LOCK_MAX_WAIT = float(getenv("DISK_CACHE_LOCK_MAX_WAIT", 5))
+DISK_CACHE_LOCK_MAX_WAIT = float(getenv("DISK_CACHE_LOCK_MAX_WAIT", 10))
 DISK_CACHE_LOCK_INTERVAL = float(getenv("DISK_CACHE_LOCK_INTERVAL", 0.1))
 DEFAULT_CACHE_AGE = int(getenv("DEFAULT_CACHE_AGE", 15))
 
@@ -203,9 +203,33 @@ def ensure_dir(directory: str) -> None:
         os.makedirs(directory)
         write_cache_file({_TOTAL_NUMCACHE_KEY: 0})
 
+import numpy as np
+
+def try_save_numpy(data: Any, file_path: str) -> bool:
+    # check if data is numpy array
+    if isinstance(data, np.ndarray):
+        np.save(file_path, data)
+        if (load_numpy(file_path,True) is None):
+            os.remove(file_path)
+            np.save(file_path, data)
+        return True
+    return False
+
+def load_numpy(file_path: str,enable_memmap=True) -> np.ndarray:
+    data = None
+    try:
+        data = np.load(file_path, mmap_mode='c')
+    except Exception as e:
+        logger.warning("Failed to load numpy file %s: %s", file_path, e)
+    
+    return data
+
+
 
 def pickle_big_data(data: Any, file_path: str) -> None:
     """Write a pickled Python object to a file in chunks"""
+    if try_save_numpy(data, file_path):
+        return
     bytes_out = pickle.dumps(data, protocol=4)
     with open_exclusive(file_path, "wb") as f_out:
         for idx in range(0, len(bytes_out), MAX_PICKLE_BYTES):
@@ -215,15 +239,21 @@ def pickle_big_data(data: Any, file_path: str) -> None:
 def unpickle_big_data(file_path: str) -> Any:
     """Return a Python object from a file containing pickled data in chunks"""
     try:
+        if file_path.endswith('.npy'):
+            return load_numpy(file_path,enable_memmap=True)
         with open_shared(file_path, "rb") as f:
             return pickle.load(f)
     except Exception:  # noqa, pylint: disable=broad-except
+        logger.warning("Failed to unpickle %s", file_path)
+        if file_path.endswith('.npy'):
+            return None
         bytes_in = bytearray(0)
         input_size = os.path.getsize(file_path)
         with open_shared(file_path, mode="rb") as f_in:
             for _ in range(0, input_size, MAX_PICKLE_BYTES):
                 bytes_in += f_in.read(MAX_PICKLE_BYTES)
         return pickle.loads(bytes_in)
+
 
 
 def get_age_of_file(filename: str, unit: str = "days") -> int:
@@ -311,7 +341,11 @@ def cache_exists(
                     cache_changed = True
                 else:
                     function_value = unpickle_big_data(file_name)
-                    return True, function_value
+                    if function_value is not None:
+                        return True, function_value
+                    else:
+                        os.remove(file_name)
+                        cache_changed = True
             else:
                 cache_changed = True
         else:
@@ -336,7 +370,9 @@ def cache_function_value(
     if function_name == _TOTAL_NUMCACHE_KEY:
         raise Exception("Cant cache function named %s" % _TOTAL_NUMCACHE_KEY)
     function_caches = cache_metadata.get(function_name, [])
-    new_file_name = str(int(cache_metadata[_TOTAL_NUMCACHE_KEY]) + 1) + ".pkl"
+    is_npy = isinstance(function_value, np.ndarray)
+    post_fix = ".npy" if is_npy else ".pkl"
+    new_file_name = str(int(cache_metadata[_TOTAL_NUMCACHE_KEY]) + 1) + post_fix
     new_cache = {
         "args": str(args),
         "kwargs": str(kwargs),
