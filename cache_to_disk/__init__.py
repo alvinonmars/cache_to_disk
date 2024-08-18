@@ -402,9 +402,17 @@ def delete_disk_caches_for_function(function_name: str) -> None:
 
 
 def cache_exists(
-    cache_metadata: Dict, function_name: str, *args, **kwargs
+    cache_metadata: Dict, function_name: str,except_arg_names: List[str] = [], *args, **kwargs
 ) -> Tuple[bool, Any]:
+    
+    if len(except_arg_names) >0:
+        assert len(args) == 0, f"except_arg_names:{except_arg_names} ,args should be empty args {args}"
+    for arg_name in except_arg_names:
+        if arg_name in kwargs:
+            kwargs.pop(arg_name)
+                
     if function_name not in cache_metadata:
+        logger.info(f"Function {function_name} not in cache metadata")
         return False, None
     new_caches_for_function = []
     cache_changed = False
@@ -423,6 +431,7 @@ def cache_exists(
     elif is_pkl:
         file_name = file_path_pkl
     else:
+        logger.error(f"Function {function_name} cache file {new_file_name} not found args:{str(args)} kwargs:{str(kwargs)}")
         return False, None
     max_age_days = UNLIMITED_CACHE_AGE
     for function_cache in cache_metadata[function_name]:
@@ -485,9 +494,10 @@ def cache_exists2(
         write_cache_file(cache_metadata)
     return False, None
 
-def cache_exists_for_function(function_name: str,*args, **kwargs)-> Tuple[bool, Any]:
+def cache_exists_for_function(function_name: str,except_arg_names,*args, **kwargs)-> Tuple[bool, Any]:
     cache_metadata = load_cache_metadata_json()
-    return cache_exists(cache_metadata,function_name,*args, **kwargs)
+    
+    return cache_exists(cache_metadata,function_name,except_arg_names,*args, **kwargs)
 
 def cache_exists_rename_to_hash():
     cache_metadata = load_cache_metadata_json()
@@ -539,7 +549,6 @@ def cache_function_value(
     # new_file_name = str(int(cache_metadata[_TOTAL_NUMCACHE_KEY]) + 1) + post_fix
     new_file_name = get_hash_filename(function_name,str(args),str(kwargs))
     new_file_name = new_file_name + post_fix
-            
     new_cache = {
         "args": str(args),
         "kwargs": str(kwargs),
@@ -556,7 +565,7 @@ def cache_function_value(
 # F = TypeVar("F", bound=Callable[..., Any])
 
 
-def cache_to_disk(n_days_to_cache: int = DEFAULT_CACHE_AGE) -> Callable:
+def cache_to_disk(n_days_to_cache: int = DEFAULT_CACHE_AGE,except_arg_names: List[str] = []) -> Callable:
     """Cache to disk"""
     if n_days_to_cache == UNLIMITED_CACHE_AGE:
         warnings.warn("Using an unlimited age cache is not recommended", stacklevel=3)
@@ -567,22 +576,22 @@ def cache_to_disk(n_days_to_cache: int = DEFAULT_CACHE_AGE) -> Callable:
         raise TypeError("Expected n_days_to_cache to be an integer or None")
 
     def decorating_function(original_function: Callable) -> Callable:
-        wrapper = _cache_to_disk_wrapper(original_function, n_days_to_cache, _CacheInfo)
+        wrapper = _cache_to_disk_wrapper(original_function, n_days_to_cache, _CacheInfo,except_arg_names)
         return wrapper
 
     return decorating_function
 
 
 def _cache_to_disk_wrapper(
-    original_func: Callable, n_days_to_cache: int, _CacheInfo: type
+    original_func: Callable, n_days_to_cache: int, _CacheInfo: type,except_arg_names: List[str] = []
 ) -> Callable:  # pylint: disable=invalid-name
     hits = misses = nocache = 0
 
     def wrapper(*args, **kwargs) -> Any:
-        nonlocal hits, misses, nocache
+        nonlocal hits, misses, nocache 
         cache_metadata = load_cache_metadata_json()
         already_cached, function_value = cache_exists(
-            cache_metadata, original_func.__name__, *args, **kwargs
+            cache_metadata, original_func.__name__,except_arg_names, *args, **kwargs
         )
         if already_cached:
             logger.debug(
@@ -620,6 +629,14 @@ def _cache_to_disk_wrapper(
             function_value = err.function_value
         else:
             logger.debug("%s() returned, adding cache entry", original_func.__name__)
+            
+            if len(except_arg_names) >0:
+                assert len(args) == 0, f"except_arg_names:{except_arg_names} ,args should be empty args {args}"
+            
+            for arg_name in except_arg_names:
+                if arg_name in kwargs:
+                    kwargs.pop(arg_name)
+                
             cache_function_value(
                 function_value,
                 n_days_to_cache,
