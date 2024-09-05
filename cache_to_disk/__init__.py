@@ -314,7 +314,10 @@ def rename_np_memmap(from_filepath, file_path: str,dtype,shape) -> bool:
             shutil.move(from_filepath,file_path)
             # os.symlink(from_filepath, file_path)
             logger.info(f"Moved numpy memmap file {from_filepath} to {file_path}")
-    return True
+        if os.path.exists(file_path):
+            data = np.memmap(file_path, dtype=dtype, mode='r', shape=shape)
+            return data
+    return None
 
 def load_np_memmap(file_path: str) -> bool:
     data = None
@@ -370,9 +373,9 @@ def pickle_big_data(data: Any, file_path: str,rename_np_memmap_file:bool) -> Non
         dtype = data.dtype
         shape = data.shape
         #close the memmap file
-        data._mmap.close()
+        # data._mmap.close()
         
-        rename_np_memmap(old_file_path, file_path,dtype=dtype,shape=shape)
+        # rename_np_memmap(old_file_path, file_path,dtype=dtype,shape=shape)
         return
     
     if isinstance(data, np.ndarray):
@@ -643,7 +646,8 @@ def cache_function_value(
         "file_name": new_file_name,
         "max_age_days": n_days_to_cache,
     }
-    pickle_big_data(function_value, join_path(DISK_CACHE_DIR, new_file_name),rename_np_memmap_file)
+    new_filepath = join_path(DISK_CACHE_DIR, new_file_name)
+    pickle_big_data(function_value, new_filepath,rename_np_memmap_file)
     
     # with open_shared(DISK_CACHE_FILE,mode='r+') as f:
     #     cache_metadata = json.load(f)
@@ -653,6 +657,7 @@ def cache_function_value(
     cache_metadata[_TOTAL_NUMCACHE_KEY] = int(cache_metadata[_TOTAL_NUMCACHE_KEY]) + 1
         # json.dump(cache_metadata, f)
     write_cache_file(cache_metadata)
+    return new_filepath
 
 # F = TypeVar("F", bound=Callable[..., Any])
 
@@ -730,7 +735,7 @@ def _cache_to_disk_wrapper(
                 if arg_name in kwargs:
                     kwargs.pop(arg_name)
             cache_metadata = load_cache_metadata_json()
-            cache_function_value(
+            new_filepath = cache_function_value(
                 function_value,
                 n_days_to_cache,
                 cache_metadata, # Function Reentrancy
@@ -739,6 +744,16 @@ def _cache_to_disk_wrapper(
                 *args,
                 **kwargs,
             )
+        
+            if isinstance(function_value, np.memmap)and rename_np_memmap_file:
+                old_file_path = function_value.filename
+                dtype = function_value.dtype
+                shape = function_value.shape
+                #close the memmap file
+                # del function_value 
+                
+                # function_value = 
+                function_value = rename_np_memmap(old_file_path, new_filepath,dtype=dtype,shape=shape)
         return function_value
 
     def cache_info() -> Type:
