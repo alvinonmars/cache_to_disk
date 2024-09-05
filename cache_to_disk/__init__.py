@@ -56,7 +56,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
 import logging,os
 from datetime import datetime
-
+import shutil
+import uuid
 
 def get_logger(name,console_enable = False,propagate = False, log_dir='/mnt/disk1/log'):
     logger = logging.getLogger(name)
@@ -149,6 +150,10 @@ _CacheInfo = namedtuple("_CacheInfo", ["hits", "misses", "nocache"])
 # logger.debug('cache_to_disk package loaded; using DISK_CACHE_DIR=%s',
 #             os.path.relpath(DISK_CACHE_DIR, '.'))
 
+def get_memmap_random_filepath():
+    filename = str(uuid.uuid4())
+    return os.path.join(DISK_CACHE_DIR,filename)
+    
 
 class NoCacheCondition(Exception):
     """Custom exception for user function to raise to prevent caching on a per-call basis
@@ -258,7 +263,7 @@ def ensure_dir(directory: str) -> None:
 
 import numpy as np
 
-def try_save_numpy(data: Any, file_path: str) -> bool:
+def try_save_numpy2(data: Any, file_path: str,rename_np_memmap_file:bool) -> bool:
     # check if data is numpy array
     if isinstance(data, np.ndarray):
         with open_exclusive(file_path, "wb") as f:
@@ -287,14 +292,70 @@ def try_save_numpy(data: Any, file_path: str) -> bool:
         return True
     return False
 
-def load_numpy(file_path: str,enable_memmap=True) -> np.ndarray:
+
+# def save_memmap_metadata(np_data:np.memmap):
+#     filename = np_data.filename
+#     dtype = np_data.dtype
+#     shape = np_data.shape
+#     with open(filename.replace('.dat','.json'), 'w') as f:
+#         json.dump({'dtype':dtype.name,'shape':shape}, f)
+        
+
+def rename_np_memmap(from_filepath, file_path: str,dtype,shape) -> bool:
+    meta_config = file_path+'.json'
+    with open_exclusive(meta_config, "w") as f:
+        # dump meta data
+        json.dump({'dtype':dtype.name,'shape':shape},f)
+        f.flush()
+        os.fsync(f.fileno())
+        if from_filepath != file_path:
+            logger.info(f"Moving numpy memmap file {from_filepath} to {file_path}")
+            
+            shutil.move(from_filepath,file_path)
+            # os.symlink(from_filepath, file_path)
+            logger.info(f"Moved numpy memmap file {from_filepath} to {file_path}")
+    return True
+
+def load_np_memmap(file_path: str) -> bool:
+    data = None
+    meta_config = file_path+'.json'
+    try:
+        with open_exclusive(meta_config, "r") as f:
+            #load meta data
+            meta_data = json.load(f)
+            
+            dtype = meta_data['dtype']
+            shape = tuple(meta_data['shape'])
+            
+            data = np.memmap(file_path, dtype=dtype, mode='r', shape=shape)
+    except Exception as e:
+        logger.warning("Failed to load numpy file %s: %s", file_path, e)
+    
+    return data
+
+def save_numpy(data: Any, file_path: str) -> bool:
+    if isinstance(data, np.ndarray):
+        with open_exclusive(file_path, "wb") as f:
+            np.save(f, data)
+            f.flush()
+            os.fsync(f.fileno())
+            logger.info(f"Saved numpy file {file_path} size {data.nbytes} human readable {np.round(data.nbytes/1024/1024,2)}MB success")
+            return True
+    else:
+        logger.warning(f"Data is not numpy array or memmap array {type(data)} {file_path}")
+        return False
+    
+    
+    
+
+def load_numpy(file_path: str,mmap_mode) -> np.ndarray:
     data = None
     try:
         with open_shared(file_path, "rb") as f:
             pass
-        
-        data = np.load(file_path, mmap_mode='c')
-            # data = np.load(f, mmap_mode='c')
+            # data = np.load(f)      
+        # data = np.load(file_path, mmap_mode='c')
+        data = np.load(file_path, mmap_mode=mmap_mode)
     except Exception as e:
         logger.warning("Failed to load numpy file %s: %s", file_path, e)
     
@@ -302,10 +363,22 @@ def load_numpy(file_path: str,enable_memmap=True) -> np.ndarray:
 
 
 
-def pickle_big_data(data: Any, file_path: str) -> None:
+def pickle_big_data(data: Any, file_path: str,rename_np_memmap_file:bool) -> None:
     """Write a pickled Python object to a file in chunks"""
-    if try_save_numpy(data, file_path):
+    if isinstance(data, np.memmap) and rename_np_memmap_file:
+        old_file_path = data.filename
+        dtype = data.dtype
+        shape = data.shape
+        #close the memmap file
+        data._mmap.close()
+        
+        rename_np_memmap(old_file_path, file_path,dtype=dtype,shape=shape)
         return
+    
+    if isinstance(data, np.ndarray):
+        save_numpy(data, file_path)
+        return
+
     bytes_out = pickle.dumps(data, protocol=4)
     with open_exclusive(file_path, "wb") as f_out:
         for idx in range(0, len(bytes_out), MAX_PICKLE_BYTES):
@@ -319,7 +392,11 @@ def unpickle_big_data(file_path: str) -> Any:
     """Return a Python object from a file containing pickled data in chunks"""
     try:
         if file_path.endswith('.npy'):
-            return load_numpy(file_path,enable_memmap=True)
+            meta_config = file_path+'.json'
+            if os.path.exists(meta_config):
+                return load_np_memmap(file_path)
+            else:
+                return load_numpy(file_path,mmap_mode='c')
         with open_shared(file_path, "rb") as f:
             return pickle.load(f)
     except Exception:  # noqa, pylint: disable=broad-except
@@ -395,7 +472,16 @@ def delete_disk_caches_for_function(function_name: str) -> None:
     functions_to_delete_cache_for = cache_metadata.pop(function_name)
     for function_cache in functions_to_delete_cache_for:
         file_name = join_path(DISK_CACHE_DIR, function_cache["file_name"])
-        os.remove(file_name)
+        if os.path.exists(file_name):
+            os.remove(file_name)
+        config_file = file_name+'.json'
+        if os.path.exists(config_file):
+            os.remove(config_file)
+            
+        config_file = file_name+'_timestamp'
+        if os.path.exists(config_file):
+            os.remove(config_file)
+        
         n_deleted += 1
     logger.debug("Removed %s cache entries for %s", n_deleted, function_name)
     write_cache_file(cache_metadata)
@@ -431,7 +517,7 @@ def cache_exists(
     elif is_pkl:
         file_name = file_path_pkl
     else:
-        logger.error(f"Function {function_name} cache file {new_file_name} not found args:{str(args)} kwargs:{str(kwargs)}")
+        logger.info(f"Function {function_name} cache file {new_file_name} not found args:{str(args)} kwargs:{str(kwargs)}")
         return False, None
     max_age_days = UNLIMITED_CACHE_AGE
     for function_cache in cache_metadata[function_name]:
@@ -537,13 +623,15 @@ def cache_function_value(
     function_value: Any,
     n_days_to_cache: int,
     cache_metadata: Any,
+    rename_np_memmap_file:bool,
     function_name: str,
     *args,
     **kwargs,
 ) -> None:
     if function_name == _TOTAL_NUMCACHE_KEY:
         raise Exception("Cant cache function named %s" % _TOTAL_NUMCACHE_KEY)
-    function_caches = cache_metadata.get(function_name, [])
+    
+
     is_npy = isinstance(function_value, np.ndarray)
     post_fix = ".npy" if is_npy else ".pkl"
     # new_file_name = str(int(cache_metadata[_TOTAL_NUMCACHE_KEY]) + 1) + post_fix
@@ -555,17 +643,21 @@ def cache_function_value(
         "file_name": new_file_name,
         "max_age_days": n_days_to_cache,
     }
-    pickle_big_data(function_value, join_path(DISK_CACHE_DIR, new_file_name))
+    pickle_big_data(function_value, join_path(DISK_CACHE_DIR, new_file_name),rename_np_memmap_file)
+    
+    # with open_shared(DISK_CACHE_FILE,mode='r+') as f:
+    #     cache_metadata = json.load(f)
+    function_caches = cache_metadata.get(function_name, [])
     function_caches.append(new_cache)
     cache_metadata[function_name] = function_caches
     cache_metadata[_TOTAL_NUMCACHE_KEY] = int(cache_metadata[_TOTAL_NUMCACHE_KEY]) + 1
+        # json.dump(cache_metadata, f)
     write_cache_file(cache_metadata)
-
 
 # F = TypeVar("F", bound=Callable[..., Any])
 
 
-def cache_to_disk(n_days_to_cache: int = DEFAULT_CACHE_AGE,except_arg_names: List[str] = []) -> Callable:
+def cache_to_disk(n_days_to_cache: int = DEFAULT_CACHE_AGE,except_arg_names: List[str] = [],rename_np_memmap_file=True) -> Callable:
     """Cache to disk"""
     if n_days_to_cache == UNLIMITED_CACHE_AGE:
         warnings.warn("Using an unlimited age cache is not recommended", stacklevel=3)
@@ -576,14 +668,14 @@ def cache_to_disk(n_days_to_cache: int = DEFAULT_CACHE_AGE,except_arg_names: Lis
         raise TypeError("Expected n_days_to_cache to be an integer or None")
 
     def decorating_function(original_function: Callable) -> Callable:
-        wrapper = _cache_to_disk_wrapper(original_function, n_days_to_cache, _CacheInfo,except_arg_names)
+        wrapper = _cache_to_disk_wrapper(original_function, n_days_to_cache, _CacheInfo,except_arg_names,rename_np_memmap_file)
         return wrapper
 
     return decorating_function
 
 
 def _cache_to_disk_wrapper(
-    original_func: Callable, n_days_to_cache: int, _CacheInfo: type,except_arg_names: List[str] = []
+    original_func: Callable, n_days_to_cache: int, _CacheInfo: type,except_arg_names: List[str] = [],rename_np_memmap_file=True
 ) -> Callable:  # pylint: disable=invalid-name
     hits = misses = nocache = 0
 
@@ -632,15 +724,17 @@ def _cache_to_disk_wrapper(
             
             if len(except_arg_names) >0:
                 assert len(args) == 0, f"except_arg_names:{except_arg_names} ,args should be empty args {args}"
+                logger.info(f"Removing except_arg_names {except_arg_names} from kwargs {kwargs.keys()}")
             
             for arg_name in except_arg_names:
                 if arg_name in kwargs:
                     kwargs.pop(arg_name)
-                
+            cache_metadata = load_cache_metadata_json()
             cache_function_value(
                 function_value,
                 n_days_to_cache,
-                cache_metadata,
+                cache_metadata, # Function Reentrancy
+                rename_np_memmap_file,
                 original_func.__name__,
                 *args,
                 **kwargs,
